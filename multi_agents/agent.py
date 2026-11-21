@@ -1,13 +1,14 @@
 import datetime
 from zoneinfo import ZoneInfo
 from google.adk.agents import Agent, SequentialAgent
-from google.adk.models.lite_llm import LiteLlm
-from google.adk.tools import google_search
+from google.adk.tools import ToolContext, google_search
+from google.genai import types
+from fpdf import FPDF
 
 
 # AGENT_MODEL = "ollama/gemma3"
 # AGENT_MODEL = "openai/gpt-5-nano"
-AGENT_MODEL = "gemini-2.0-flash"
+AGENT_MODEL = "gemini-3.8-flash"
 
 
 def get_weather(city: str) -> dict:
@@ -79,11 +80,85 @@ def get_current_time(city: str) -> dict:
     return {"status": "success", "report": report}
 
 
+# --- PDF tool ---
+_PDF_CHAR_MAP = {
+    "–": "-", "—": "-", "‘": "'", "’": "'",
+    "“": '"', "”": '"', "•": "-", "…": "...",
+    " ": " ", "→": "->", "₹": "Rs ", "✓": "v",
+}
+
+
+def _pdf_safe(text: str) -> str:
+    """PDF core fonts only support latin-1; map common symbols, drop the rest."""
+    for src, dst in _PDF_CHAR_MAP.items():
+        text = text.replace(src, dst)
+    return text.encode("latin-1", "ignore").decode("latin-1")
+
+
+async def create_pdf(title: str, content: str, tool_context: ToolContext) -> dict:
+    """Creates a PDF document from the given text and saves it as a downloadable artifact.
+
+    Call this once, after the final response is written, passing the complete
+    final response as `content`.
+
+    Args:
+        title (str): The title shown at the top of the PDF (e.g. "Paris 5-Day Trip Plan").
+        content (str): The full text for the PDF body. Simple markdown is supported:
+            '#', '##', '###' headings, '-' or '*' bullets, and **bold**.
+
+    Returns:
+        dict: 'status' ('success' or 'error'); on success also 'filename' and 'version'.
+    """
+    try:
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.multi_cell(0, 10, _pdf_safe(title), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(4)
+
+        for raw in content.splitlines():
+            line = _pdf_safe(raw.rstrip())
+            stripped = line.lstrip()
+            if not stripped:
+                pdf.ln(3)
+                continue
+            if stripped.startswith("#"):
+                level = len(stripped) - len(stripped.lstrip("#"))
+                text = stripped.lstrip("#").strip().replace("**", "")
+                pdf.ln(2)
+                pdf.set_font("Helvetica", "B", {1: 16, 2: 14}.get(level, 12))
+                pdf.multi_cell(0, 7, text, new_x="LMARGIN", new_y="NEXT")
+                pdf.set_font("Helvetica", "", 11)
+            elif stripped.startswith(("- ", "* ")):
+                indent = 6 + 4 * ((len(line) - len(stripped)) // 2)
+                pdf.set_x(pdf.l_margin + indent)
+                pdf.set_font("Helvetica", "", 11)
+                pdf.multi_cell(0, 6, "- " + stripped[2:], markdown=True,
+                               new_x="LMARGIN", new_y="NEXT")
+            else:
+                pdf.set_font("Helvetica", "", 11)
+                pdf.multi_cell(0, 6, stripped, markdown=True,
+                               new_x="LMARGIN", new_y="NEXT")
+
+        safe_name = "".join(c if c.isalnum() else "_" for c in title).strip("_") or "response"
+        filename = f"{safe_name[:50]}.pdf"
+        version = await tool_context.save_artifact(
+            filename=filename,
+            artifact=types.Part.from_bytes(
+                data=bytes(pdf.output()), mime_type="application/pdf"
+            ),
+        )
+        return {"status": "success", "filename": filename, "version": version}
+    except Exception as e:  # report back to the model instead of crashing the run
+        return {"status": "error", "error_message": f"Could not create PDF: {e}"}
+
+
 # -- Sequential Agent ---
 # Destination Research Agent - Researches location information
 destination_research_agent = Agent(
     name="DestinationResearchAgent",
-    model="gemini-2.0-flash",
+    model=AGENT_MODEL,
     tools=[google_search],
     description="An agent that researches travel destinations and gathers essential information",
     instruction="""
@@ -138,7 +213,12 @@ travel_optimizer_agent = Agent(
     TRAVEL ESSENTIALS: [packing and preparation advice here]
     
     BACKUP PLANS: [alternative options and contingencies here]
+
+    After writing the final output above, call the create_pdf tool exactly once with a short
+    descriptive title and the complete final output as content. Then tell the user the PDF
+    is ready to download from the artifacts panel.
     """,
+    tools=[create_pdf],
 )
 
 root_agent = SequentialAgent(
